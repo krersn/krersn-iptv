@@ -1,0 +1,4 @@
+python-mpv
+customtkinter
+pillow
+requests
