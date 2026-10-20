@@ -42,6 +42,7 @@ a = Analysis(
     binaries=_binaries,
     datas=[('krersn.ico', '.'), ('krersn.png', '.')],
     hiddenimports=['PIL', 'PIL.Image', 'PIL.ImageDraw', 'PIL.ImageOps',
+                   'PIL.ImageTk', 'PIL._tkinter_finder',
                    'mpv', 'customtkinter'],
     hookspath=[],
     hooksconfig={},

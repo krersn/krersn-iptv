@@ -21,7 +21,68 @@ from tkinter import filedialog, messagebox
 from urllib.parse import urlsplit
 import customtkinter as ctk
 import requests
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageOps, ImageTk
+import tkinter.font as tkfont
+
+# ============================== ARAYÜZ KUYRUĞU ==============================
+# Tkinter iş parçacığı güvenli DEĞİL. Eskiden afiş/ağ/mpv iş parçacıkları
+# doğrudan widget.after(0, …) çağırıyordu; bu ara ara kilitlenme ve
+# "yanıt vermiyor" donmalarına yol açıyordu. Artık iş parçacıkları yalnızca
+# bu kuyruğa yazar; kuyruğu ana döngü boşaltır.
+_UI_KUYRUGU = queue.SimpleQueue()
+
+def ui_cagir(fn, *args):
+    """Herhangi bir iş parçacığından güvenle çağrılabilir."""
+    _UI_KUYRUGU.put((fn, args))
+
+def ui_pompasini_baslat(root):
+    def pompa():
+        bitis = time.perf_counter() + 0.012      # tek turda en fazla ~12 ms
+        while True:
+            try:
+                fn, args = _UI_KUYRUGU.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args)
+            except Exception as e:
+                print(f"[arayüz] {e}")
+            if time.perf_counter() > bitis:
+                break
+        try:
+            root.after(15, pompa)
+        except Exception:
+            pass
+    root.after(15, pompa)
+
+# Oynatma sürerken afiş indirmeleri tek tek ve aralıklı yapılır; yayının
+# bant genişliği afişlere gitmez.
+OYNATMA_AKTIF = threading.Event()
+_OYNATMA_INDIRME_KILIDI = threading.Lock()
+
+def afis_indir(session, url, timeout):
+    if OYNATMA_AKTIF.is_set():
+        with _OYNATMA_INDIRME_KILIDI:
+            time.sleep(0.2)
+            return session.get(url, timeout=timeout)
+    return session.get(url, timeout=timeout)
+
+_MASKE_ONBELLEK = {}
+
+def yuvarlak_maske(w, h, r):
+    """Kenarları yumuşak yuvarlak köşe maskesi (önbellekli)."""
+    anahtar = (w, h, r)
+    maske = _MASKE_ONBELLEK.get(anahtar)
+    if maske is None:
+        k = 3
+        maske = Image.new("L", (w * k, h * k), 0)
+        ImageDraw.Draw(maske).rounded_rectangle(
+            (0, 0, w * k - 1, h * k - 1), radius=max(1, r * k), fill=255)
+        maske = maske.resize((w, h), Image.LANCZOS)
+        if len(_MASKE_ONBELLEK) > 32:
+            _MASKE_ONBELLEK.clear()
+        _MASKE_ONBELLEK[anahtar] = maske
+    return maske
 
 # ============================== VERİ KLASÖRÜ ==============================
 def havuz_kapat(havuz):
@@ -657,18 +718,29 @@ def build_mpv_options(settings, kind, quality, extra_buffer=0):
     buffer_ms = max(300, int(settings.get("buffer_ms", 2000)) + extra_buffer)
     secs = round(buffer_ms / 1000.0, 2)
     profile = "low-latency" if (is_live and buffer_ms <= 1500) else None
+    dusuk_gecikme = profile is not None
+    # Canlı yayında önden okuma eskiden yalnızca tampon kadardı (2 sn) ve
+    # takılınca 1 sn dolunca devam ediliyordu: "dur – oyna – dur" döngüsü.
+    # Önden okuma gecikmeyi artırmaz (canlı akış gerçek zamanlı gelir), sadece
+    # sunucunun gönderdiği fazlayı biriktirir.
+    if is_live:
+        okuma = secs if dusuk_gecikme else max(15.0, secs)
+        bekleme = 1.0 if dusuk_gecikme else max(3.0, min(8.0, secs * 0.75))
+    else:
+        okuma = max(10.0, secs + 5)
+        bekleme = max(2.0, min(8.0, secs / 2))
     opts = {
         "network-timeout": 10 if is_live else 15,
         "user-agent": "IPTVPanel/3.0",
         "stream-lavf-o": ("reconnect=1,reconnect_streamed=1,"
                           "reconnect_on_network_error=1,reconnect_delay_max=5"),
         "cache": "yes",
-        "cache-secs": secs if is_live else max(10.0, secs + 5),
-        "demuxer-readahead-secs": secs if is_live else max(10.0, secs + 5),
-        "demuxer-max-bytes": "32MiB" if is_live else "96MiB",
+        "cache-secs": okuma,
+        "demuxer-readahead-secs": okuma,
+        "demuxer-max-bytes": "64MiB" if is_live else "96MiB",
         "demuxer-max-back-bytes": "16MiB" if is_live else "48MiB",
         "cache-pause": "yes",
-        "cache-pause-wait": max(0.3, secs / 2),
+        "cache-pause-wait": bekleme,
         "cache-pause-initial": "yes" if buffer_ms >= 1500 else "no",
         "hwdec": "no" if settings.get("hw_accel") == "none" else "auto-safe",
         "framedrop": "vo",
@@ -678,7 +750,7 @@ def build_mpv_options(settings, kind, quality, extra_buffer=0):
         opts.update({
             "video-sync": "audio",
             "demuxer-lavf-probe-info": "nostreams",
-            "demuxer-lavf-analyzeduration": 0.5,
+            "demuxer-lavf-analyzeduration": 0.5 if dusuk_gecikme else 1.0,
             "hr-seek": "no",
         })
     else:
@@ -967,24 +1039,33 @@ class VirtualList(ctk.CTkFrame):
 
 # ============================== İÇERİK GRİD ==============================
 class ContentGrid(ctk.CTkFrame):
-    COLS = 5              # sabit: her satırda 5 afiş
+    """Sanal afiş ızgarası.
+
+    Eskiden her içerik için 4 ayrı CTk bileşeni (kart, görsel, başlık, alt
+    bilgi) oluşturuluyordu; 2000–4000 öğelik "Tümü" ve arama listelerinde
+    8–16 bin bileşen arayüzü dakikalarca donduruyordu. Artık tek bir Canvas
+    var; yalnızca ekranda görünen kartlar çiziliyor ve afişler yalnızca
+    görünen (ve hemen altındaki) kartlar için indiriliyor.
+    """
+    COLS = 5              # en fazla 5 kolon
     MIN_COLS = 2          # pencere daralırsa okunaklı kalsın diye alt sınır
     MAX_COLS = 5
     CARD_PAD = 6          # kart başına tek taraf boşluk (toplam 2x)
-    SCROLL_RESERVE = 34   # kaydırma çubuğu + iç kenar payı
+    SCROLL_RESERVE = 8    # kenar payı (kaydırma çubuğu artık ayrı)
     MIN_CARD_W = 150      # bunun altına inmek yerine kolon azaltılır
     MAX_CARD_W = 320      # çok geniş ekranda afiş devleşmesin
     LIVE_MAX_CARD_W = 232 # kanal logosu dairesi gereksiz büyümesin
     POSTER_RATIO = 1.5    # 2:3 afiş oranı
-    TITLE_BLOCK = 61      # başlık + alt bilgi + boşluklar
+    TITLE_BLOCK = 68      # başlık (2 satır) + alt bilgi + boşluklar
     MASTER_W = 420        # diske kaydedilen ana afiş (yeniden ölçekleme kaynağı)
     MASTER_H = 630
     LOGO_MASTER = 420     # canlı TV: dairesel kanal logosunun ana ölçüsü
-    # geriye dönük uyumluluk (dışarıdan okunabiliyor)
     CARD_W = 203
     CARD_H = 336
     IMG_W = 183
     IMG_H = 274
+    ISCI_SAYISI = 4       # paralel afiş indirme
+    FOTO_SINIRI = 240     # bellekte tutulan hazır afiş sayısı
 
     def __init__(self, master, on_select=None, on_activate=None, on_context=None):
         super().__init__(master, fg_color=C["bg"])
@@ -992,221 +1073,521 @@ class ContentGrid(ctk.CTkFrame):
         self.on_activate = on_activate
         self.on_context = on_context
         self._items = []
-        self._cards = []
         self._selected = -1
-        self._poster_refs = {}
-        self._masters = {}
+        self._hover = -1
         self.circular = False      # canlı TV'de kanal logoları yuvarlak
-        self._bos_daire_ref = {}
+        self._session = None
         self._nesil = 0            # liste değişince artar; eski indirmeler iptal olur
-        self._isler = []
-        self._pool = ThreadPoolExecutor(max_workers=6)
+        self._offset = 0.0
         self._alive = True
-        self.cols = self.COLS
-        self.card_w = self.CARD_W
-        self.card_h = self.CARD_H
-        self.img_w = self.IMG_W
-        self.img_h = self.IMG_H
-        self._resize_after = None
-        self._last_width = 0
-
-        self.scroll = ctk.CTkScrollableFrame(self, fg_color=C["bg"],
-                                              scrollbar_button_color=C["line"],
-                                              scrollbar_button_hover_color=C["muted"])
-        self.scroll.pack(fill="both", expand=True)
-        self.grid_frame = ctk.CTkFrame(self.scroll, fg_color=C["bg"])
-        self.grid_frame.pack(fill="both", expand=True, padx=4, pady=4)
-        self._placeholder_label = ctk.CTkLabel(self.grid_frame, text="Kategori seçin",
-                                                font=ui_font(13), text_color=C["muted"])
-        self._placeholder_label.grid(row=0, column=0, columnspan=self.cols, pady=60)
-        self._apply_columns(self.cols)
+        self._placeholder = "Kategori seçin"
+        self._fotolar = OrderedDict()     # index -> PhotoImage (geçerli boyutta)
+        self._istenen = set()             # indirmesi istenmiş index'ler
+        self._kilit = threading.Lock()
+        self._q = queue.LifoQueue()       # son istenen (ekrandaki) önce iner
+        self._gorunur = (0, -1)
+        self._kart_gorselleri = {}
+        self._bos_onbellek = {}
+        self._baslik_onbellek = {}
+        self._ciz_planli = False
         try:
-            self.bind("<Configure>", self._on_resize, add="+")
+            self.scale = float(ctk.ScalingTracker.get_widget_scaling(self))
+        except Exception:
+            self.scale = 1.0
+        self.cols = self.COLS
+        self.card_w = self._s(self.CARD_W)
+        self.card_h = self._s(self.CARD_H)
+        self.img_w = self._s(self.IMG_W)
+        self.img_h = self._s(self.IMG_H)
+        aile = canvas_font(12)[0]
+        self._baslik_font = (aile, -self._s(12), "bold")
+        self._meta_font = (aile, -self._s(10), "normal")
+        self._bilgi_font = (aile, -self._s(13), "normal")
+        try:
+            self._baslik_olcer = tkfont.Font(family=aile, size=-self._s(12), weight="bold")
+        except Exception:
+            self._baslik_olcer = None
+        self._harf_genislik = {}   # karakter -> piksel (ölçüm pahalı, bir kez yapılır)
+
+        self.canvas = tk.Canvas(self, bg=C["bg"], highlightthickness=0, bd=0, takefocus=1)
+        self.sb = ctk.CTkScrollbar(self, command=self.yview, width=12,
+                                   fg_color="transparent",
+                                   button_color=C["line"], button_hover_color=C["muted"])
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.sb.pack(side="right", fill="y", padx=(2, 0))
+        cv = self.canvas
+        cv.bind("<Configure>", lambda e: self._ciz_planla())
+        cv.bind("<Motion>", self._on_motion)
+        cv.bind("<Leave>", self._on_leave)
+        cv.bind("<Button-1>", self._on_click_event)
+        cv.bind("<Double-Button-1>", self._on_double_event)
+        cv.bind("<Button-3>", self._on_right_event)
+        cv.bind("<Key>", self._on_key)
+        # Fare tekerleği: odak başka yerdeyken de (ör. arama kutusu) imlecin
+        # altındaki ızgarayı kaydırır.
+        try:
+            ust = self.winfo_toplevel()
+            for olay in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                ust.bind(olay, self._kok_tekerlek, add="+")
         except Exception:
             pass
+        for _ in range(self.ISCI_SAYISI):
+            threading.Thread(target=self._isci, daemon=True).start()
 
-    # ---- yerleşim ölçüleri ----
+    # ---------------- ölçüler ----------------
+    def _s(self, deger):
+        return int(round(deger * self.scale))
+
     def _metrics(self, width):
-        """Sabit 5 kolon; kart genişliği pencereye göre büyür.
+        """En fazla 5 kolon; kart genişliği pencereye göre büyür.
         Pencere çok darsa kolon sayısı düşürülür."""
-        usable = max(0, int(width) - self.SCROLL_RESERVE)
+        usable = max(0, int(width) - self._s(self.SCROLL_RESERVE))
+        pad2 = self._s(self.CARD_PAD) * 2
         cols = self.COLS
-        while cols > self.MIN_COLS and usable / cols < self.MIN_CARD_W + self.CARD_PAD * 2:
+        while cols > self.MIN_COLS and usable / cols < self._s(self.MIN_CARD_W) + pad2:
             cols -= 1
-        ust_sinir = self.LIVE_MAX_CARD_W if self.circular else self.MAX_CARD_W
-        card_w = int(usable / cols) - self.CARD_PAD * 2
-        card_w = max(self.MIN_CARD_W, min(ust_sinir, card_w))
+        ust_sinir = self._s(self.LIVE_MAX_CARD_W if self.circular else self.MAX_CARD_W)
+        card_w = int(usable / cols) - pad2
+        card_w = max(self._s(self.MIN_CARD_W), min(ust_sinir, card_w))
         card_w -= card_w % 2                      # tek piksel titremesini önler
-        img_w = card_w - 20
+        img_w = card_w - self._s(20)
         # Yuvarlak kanal logosu kare kutuya oturur; afişler 2:3 kalır.
         img_h = img_w if self.circular else int(round(img_w * self.POSTER_RATIO))
-        card_h = img_h + self.TITLE_BLOCK
+        card_h = img_h + self._s(self.TITLE_BLOCK)
         return cols, card_w, card_h, img_w, img_h
 
-    def _apply_columns(self, cols):
-        for i in range(self.COLS + 1):
-            try:
-                self.grid_frame.grid_columnconfigure(
-                    i, weight=1 if i < cols else 0,
-                    uniform="poster" if i < cols else "")
-            except Exception:
-                pass
-
-    def _on_resize(self, event=None):
-        width = getattr(event, "width", 0) or self.winfo_width()
-        if width <= 1 or abs(width - self._last_width) < 6:
-            return
-        self._last_width = width
-        if self._resize_after:
-            try:
-                self.after_cancel(self._resize_after)
-            except Exception:
-                pass
-        self._resize_after = self.after(120, lambda w=width: self._relayout(w))
-
-    def _relayout(self, width):
-        self._resize_after = None
-        if not self._alive:
+    def _olcu_guncelle(self):
+        width = self.canvas.winfo_width()
+        if width <= 1:
             return
         cols, card_w, card_h, img_w, img_h = self._metrics(width)
-        if (cols, card_w, img_w) == (self.cols, self.card_w, self.img_w):
-            return
-        boyut_degisti = (card_w, img_w) != (self.card_w, self.img_w)
+        if (img_w, img_h, card_w) != (self.img_w, self.img_h, self.card_w):
+            # Boyut değişti: hazır görseller yeniden (diskten) ölçeklenecek.
+            self._fotolar = OrderedDict()
+            with self._kilit:
+                self._istenen = set()
+            self._kart_gorselleri = {}
+            self._baslik_onbellek = {}
         self.cols, self.card_w, self.card_h = cols, card_w, card_h
         self.img_w, self.img_h = img_w, img_h
-        self._apply_columns(cols)
-        if not (self._items and self._cards):
-            try:
-                self._placeholder_label.grid_configure(columnspan=cols)
-            except Exception:
-                pass
-            return
-        for i, card in enumerate(self._cards):
-            try:
-                card.grid_configure(row=i // cols, column=i % cols)
-                if boyut_degisti:
-                    card.configure(width=card_w, height=card_h)
-                    card._img_label.configure(width=img_w, height=img_h)
-                    card._title_label.configure(wraplength=card_w - 20)
-            except Exception:
-                pass
-        if boyut_degisti:
-            # Afişler diskteki ana görselden yeniden ölçekleniyor: ağ trafiği yok.
-            for ctk_img in self._poster_refs.values():
-                try:
-                    ctk_img.configure(size=(img_w, img_h))
-                except Exception:
-                    pass
 
-    def _sync_metrics(self):
-        width = self.winfo_width()
-        if width > 1:
-            cols, card_w, card_h, img_w, img_h = self._metrics(width)
-            self.cols, self.card_w, self.card_h = cols, card_w, card_h
-            self.img_w, self.img_h = img_w, img_h
-            self._apply_columns(self.cols)
-        return self.cols
+    def _satir_h(self):
+        return self.card_h + self._s(self.CARD_PAD) * 2
 
+    def _toplam_h(self):
+        satir = (len(self._items) + self.cols - 1) // self.cols
+        return satir * self._satir_h() + self._s(self.CARD_PAD)
+
+    def _kart_konumu(self, idx, hucre_w, satir_h):
+        row, col = divmod(idx, self.cols)
+        x0 = int(col * hucre_w + (hucre_w - self.card_w) / 2)
+        y0 = int(row * satir_h + self._s(self.CARD_PAD) - self._offset)
+        return x0, y0
+
+    # ---------------- dış arayüz (eskisiyle aynı) ----------------
     def set_items(self, items, session=None):
-        self._cleanup()
-        self._items = items or []
+        self._yeni_nesil()
+        self._items = list(items or [])
+        self._session = session
         self._selected = -1
+        self._hover = -1
+        self._offset = 0.0
         # Canlı TV listesinde logolar yuvarlak, film/dizide afiş dikdörtgen.
         self.circular = bool(self._items) and all(
             (it.get("data") or {}).get("kind") == "live" for it in self._items[:12])
-        nesil = self._nesil
-        cols = self._sync_metrics()
         if not self._items:
-            self._placeholder_label.configure(text="Bu kategoride içerik yok")
-            self._placeholder_label.grid(row=0, column=0, columnspan=cols, pady=60)
-            return
-        self._placeholder_label.grid_forget()
-        for i, item in enumerate(self._items):
-            row = i // cols
-            col = i % cols
-            card = self._create_card(item, i, row, col)
-            self._cards.append(card)
-            url = item.get("data", {}).get("icon", "")
-            if url and session:
-                self._isler.append(
-                    self._pool.submit(self._load_poster, url, i, session, nesil))
+            self._placeholder = "Bu kategoride içerik yok"
+        self._ciz()
 
     def set_placeholder(self, text):
-        self._cleanup()
+        self._yeni_nesil()
         self._items = []
-        cols = self._sync_metrics()
-        self._placeholder_label.configure(text=text)
-        self._placeholder_label.grid(row=0, column=0, columnspan=cols, pady=60)
+        self._placeholder = text
+        self._offset = 0.0
+        self._selected = -1
+        self._hover = -1
+        self._ciz()
 
     def selected(self):
         if 0 <= self._selected < len(self._items):
             return self._items[self._selected]
         return None
 
-    def _cleanup(self):
-        # Liste değişti: önceki listenin bekleyen afiş indirmelerini iptal et.
-        # Aksi halde 2000 kartlık bir kategoriden çıkıldığında yeni listenin
-        # afişleri o kuyruğun arkasında dakikalarca bekliyor.
+    def _yeni_nesil(self):
+        # Liste değişti: önceki listenin bekleyen afiş işlerini bırak.
         self._nesil += 1
-        for is_ in self._isler:
-            try:
-                is_.cancel()
-            except Exception:
-                pass
-        self._isler = []
-        for card in self._cards:
-            try:
-                card.destroy()
-            except Exception:
-                pass
-        self._cards = []
-        self._poster_refs = {}
-        self._masters = {}
+        with self._kilit:
+            self._istenen = set()
+        self._fotolar = OrderedDict()
+        self._baslik_onbellek = {}
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
 
-    def _create_card(self, item, index, row, col):
-        card = ctk.CTkFrame(self.grid_frame, width=self.card_w, height=self.card_h,
-                            fg_color=C["panel"], corner_radius=10, border_width=0)
-        card.grid(row=row, column=col, padx=self.CARD_PAD, pady=self.CARD_PAD, sticky="n")
-        card.grid_propagate(False)
-        # Dairesel modda yuvarlaklık görüntünün alfa kanalından gelir;
-        # etikete corner_radius verilmez (CTk büyük yarıçapta görüntüyü gizliyor).
-        img_label = ctk.CTkLabel(card, text="", font=ui_font(28),
-                                 text_color=C["muted"],
-                                 width=self.img_w, height=self.img_h,
-                                 fg_color="transparent" if self.circular else C["panel2"],
-                                 corner_radius=0 if self.circular else 6)
-        img_label.pack(padx=10, pady=(10, 6))
-        if self.circular:
-            img_label.configure(image=self._bos_daire_gorsel(), text="")
-        title = item.get("text", "")
-        if len(title) > 40:
-            title = title[:39] + "…"
-        title_label = ctk.CTkLabel(card, text=title, font=ui_font(12, "bold"),
-                                   text_color=C["text"], wraplength=self.card_w - 20,
-                                   height=34, justify="center")
-        title_label.pack(padx=8, pady=(0, 1))
-        meta_label = ctk.CTkLabel(card, text=item.get("meta", ""), font=ui_font(10),
-                                  text_color=C["muted"], height=14)
-        meta_label.pack(padx=8, pady=(0, 6))
-        for w in (card, img_label, title_label, meta_label):
-            w.bind("<Button-1>", lambda e, idx=index: self._on_click(idx))
-            w.bind("<Double-Button-1>", lambda e, idx=index: self._on_double(idx))
-            w.bind("<Button-3>", lambda e, idx=index: self._on_right(e, idx))
-        card._img_label = img_label
-        card._title_label = title_label
-        card._index = index
-        return card
+    # ---------------- çizim ----------------
+    def _ciz_planla(self):
+        if self._ciz_planli or not self._alive:
+            return
+        self._ciz_planli = True
+        try:
+            self.after_idle(self._ciz)
+        except Exception:
+            self._ciz_planli = False
 
-    def _bos_daire_gorsel(self):
-        """Logo yüklenene kadar gösterilen boş daire (kartlar paylaşır)."""
-        anahtar = self.img_w
-        gorsel = self._bos_daire_ref.get(anahtar) if self._bos_daire_ref else None
+    def _kart_gorseli(self, durum):
+        """0: normal, 1: üzerinde, 2: seçili — kenarı yumuşak yuvarlak kart zemini."""
+        anahtar = (self.card_w, self.card_h, durum)
+        gorsel = self._kart_gorselleri.get(anahtar)
         if gorsel is None:
-            ham = bos_daire(max(2, self.img_w), C["panel2"])
-            gorsel = ctk.CTkImage(light_image=ham, dark_image=ham,
-                                  size=(self.img_w, self.img_h))
-            self._bos_daire_ref = {anahtar: gorsel}
+            k = 3
+            w, h = self.card_w, self.card_h
+            im = Image.new("RGB", (w * k, h * k), _hex_rgb(C["bg"]))
+            d = ImageDraw.Draw(im)
+            r = self._s(10) * k
+            dolgu = _hex_rgb(C["panel"])
+            if durum:
+                kenar = _hex_rgb(C["accent"] if durum == 2 else C["line"])
+                b = self._s(2) * k
+                d.rounded_rectangle((0, 0, w * k - 1, h * k - 1), radius=r, fill=kenar)
+                d.rounded_rectangle((b, b, w * k - 1 - b, h * k - 1 - b),
+                                    radius=max(1, r - b), fill=dolgu)
+            else:
+                d.rounded_rectangle((0, 0, w * k - 1, h * k - 1), radius=r, fill=dolgu)
+            gorsel = ImageTk.PhotoImage(im.resize((w, h), Image.LANCZOS))
+            self._kart_gorselleri[anahtar] = gorsel
         return gorsel
+
+    def _bos_gorsel(self):
+        """Afiş/logo yüklenene kadar gösterilen yer tutucu (kartlar paylaşır)."""
+        anahtar = (self.img_w, self.img_h, self.circular)
+        gorsel = self._bos_onbellek.get(anahtar)
+        if gorsel is None:
+            zemin = Image.new("RGB", (self.img_w, self.img_h), _hex_rgb(C["panel"]))
+            if self.circular:
+                daire = bos_daire(max(2, self.img_w), C["panel2"])
+                zemin.paste(daire, (0, 0), daire)
+            else:
+                dolu = Image.new("RGB", (self.img_w, self.img_h), _hex_rgb(C["panel2"]))
+                zemin.paste(dolu, (0, 0), yuvarlak_maske(self.img_w, self.img_h, self._s(6)))
+            gorsel = ImageTk.PhotoImage(zemin)
+            self._bos_onbellek = {anahtar: gorsel}
+        return gorsel
+
+    def _olc(self, metin):
+        """Metin genişliği; her karakter bir kez ölçülüp önbelleğe alınır."""
+        tablo = self._harf_genislik
+        toplam = 0
+        for ch in metin:
+            w = tablo.get(ch)
+            if w is None:
+                w = self._baslik_olcer.measure(ch)
+                tablo[ch] = w
+            toplam += w
+        return toplam
+
+    def _sigdir(self, satir, genislik):
+        if self._olc(satir) <= genislik:
+            return satir
+        while satir and self._olc(satir + "…") > genislik:
+            satir = satir[:-1]
+        return satir.rstrip() + "…"
+
+    def _baslik(self, idx, metin):
+        """Başlık en fazla 2 satır; taşarsa '…' ile kısaltılır (önbellekli)."""
+        anahtar = (idx, self.card_w)
+        sonuc = self._baslik_onbellek.get(anahtar)
+        if sonuc is not None:
+            return sonuc
+        genislik = self.card_w - self._s(16)
+        olcer = self._baslik_olcer
+        if olcer is None:
+            sonuc = metin if len(metin) <= 40 else metin[:39] + "…"
+        else:
+            satirlar, simdiki = [], ""
+            for kelime in str(metin).split():
+                aday = (simdiki + " " + kelime).strip()
+                if not simdiki or self._olc(aday) <= genislik:
+                    simdiki = aday
+                else:
+                    satirlar.append(simdiki)
+                    simdiki = kelime
+            if simdiki:
+                satirlar.append(simdiki)
+            if len(satirlar) > 2:
+                satirlar = [satirlar[0], " ".join(satirlar[1:]) + "…"]
+            sonuc = "\n".join(self._sigdir(s, genislik) for s in satirlar)
+        self._baslik_onbellek[anahtar] = sonuc
+        return sonuc
+
+    def _ciz(self):
+        self._ciz_planli = False
+        if not self._alive:
+            return
+        cv = self.canvas
+        W, H = cv.winfo_width(), cv.winfo_height()
+        cv.delete("all")
+        if W <= 1 or H <= 1:
+            return
+        if not self._items:
+            cv.create_text(W / 2, self._s(60), text=self._placeholder,
+                           fill=C["muted"], font=self._bilgi_font)
+            self._gorunur = (0, -1)
+            self._sync_scrollbar()
+            return
+        self._olcu_guncelle()
+        satir_h = self._satir_h()
+        max_off = max(0, self._toplam_h() - H)
+        self._offset = max(0.0, min(self._offset, max_off))
+        ilk_satir = int(self._offset // satir_h)
+        son_satir = int((self._offset + H) // satir_h)
+        ilk = ilk_satir * self.cols
+        son = min(len(self._items) - 1, (son_satir + 1) * self.cols - 1)
+        self._gorunur = (ilk, son)
+        hucre_w = W / self.cols
+        orta = self.card_w / 2
+        bos = self._bos_gorsel()
+        istenecek = []
+        for idx in range(ilk, son + 1):
+            x0, y0 = self._kart_konumu(idx, hucre_w, satir_h)
+            durum = 2 if idx == self._selected else (1 if idx == self._hover else 0)
+            cv.create_image(x0, y0, image=self._kart_gorseli(durum), anchor="nw")
+            ix, iy = x0 + self._s(10), y0 + self._s(10)
+            foto = self._fotolar.get(idx)
+            if foto is not None:
+                self._fotolar.move_to_end(idx)
+                cv.create_image(ix, iy, image=foto, anchor="nw")
+            else:
+                cv.create_image(ix, iy, image=bos, anchor="nw")
+                istenecek.append(idx)
+            item = self._items[idx]
+            ty = iy + self.img_h + self._s(6)
+            cv.create_text(x0 + orta, ty, text=self._baslik(idx, item.get("text", "")),
+                           fill=C["text"], font=self._baslik_font, anchor="n",
+                           justify="center")
+            meta = item.get("meta", "")
+            if meta:
+                cv.create_text(x0 + orta, y0 + self.card_h - self._s(7), text=meta,
+                               fill=C["muted"], font=self._meta_font, anchor="s")
+        # Bir alt satırı önceden iste; LIFO kuyrukta ekrandakiler önce insin.
+        sonraki = range(son + 1, min(len(self._items), son + 1 + self.cols))
+        for idx in sonraki:
+            if idx not in self._fotolar:
+                self._afis_iste(idx)
+        for idx in reversed(istenecek):
+            self._afis_iste(idx)
+        self._sync_scrollbar()
+
+    # ---------------- afiş yükleme ----------------
+    def _afis_iste(self, idx):
+        if not self._session or not (0 <= idx < len(self._items)):
+            return
+        url = (self._items[idx].get("data") or {}).get("icon") or ""
+        if not url:
+            return
+        with self._kilit:
+            if idx in self._istenen:
+                return
+            self._istenen.add(idx)
+        self._q.put((self._nesil, idx, url, self.circular,
+                     self.img_w, self.img_h, self._session))
+
+    def _isci(self):
+        while self._alive:
+            try:
+                is_ = self._q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            nesil, idx, url, dairesel, w, h, session = is_
+            if nesil != self._nesil:
+                continue
+            ilk, son = self._gorunur
+            pay = self.cols * 2
+            if not (ilk - pay <= idx <= son + pay):
+                # Hızlı kaydırmada ekrandan çıkmış: geri gelince yeniden istenir.
+                with self._kilit:
+                    self._istenen.discard(idx)
+                continue
+            try:
+                img = self._afis_hazirla(url, dairesel, w, h, session)
+            except Exception:
+                img = None                 # başarısız: bu listede tekrar denenmez
+            if img is None or nesil != self._nesil or not self._alive:
+                continue
+            ui_cagir(self._afis_geldi, nesil, idx, (w, h), img)
+
+    def _afis_hazirla(self, url, dairesel, w, h, session):
+        """İş parçacığında çalışır: yalnızca PIL, Tk yok."""
+        # Disk önbelleğinde tek bir "ana" görsel tutuluyor (eski sürümle aynı
+        # anahtarlar); kart boyutu değişince buradan yeniden ölçekleniyor.
+        if dairesel:
+            path = os.path.join(POSTER_DIR,
+                                _digest(f"{url}|daire{self.LOGO_MASTER}") + ".png")
+        else:
+            path = os.path.join(POSTER_DIR,
+                                _digest(f"{url}|ana{self.MASTER_W}x{self.MASTER_H}") + ".jpg")
+        img = None
+        if os.path.exists(path):
+            try:
+                img = Image.open(path)
+                img.load()
+            except Exception:
+                img = None              # bozuk önbellek dosyası: yeniden indir
+        if img is None:
+            resp = afis_indir(session, url, 8)
+            resp.raise_for_status()
+            ham = Image.open(io.BytesIO(resp.content))
+            if dairesel:
+                # Kanal logosu kırpılmaz; daire içine sığdırılır.
+                img = dairesel_logo(ham, self.LOGO_MASTER, C["panel2"])
+                img.save(path, "PNG")
+            else:
+                # Oranı bozmadan kutuyu dolduran kırpma (afişler yamulmuyor)
+                img = ImageOps.fit(ham.convert("RGB"), (self.MASTER_W, self.MASTER_H),
+                                   Image.LANCZOS, centering=(0.5, 0.45))
+                img.save(path, "JPEG", quality=88)
+        zemin = Image.new("RGB", (w, h), _hex_rgb(C["panel"]))
+        if dairesel:
+            logo = img.convert("RGBA").resize((w, h), Image.LANCZOS)
+            zemin.paste(logo, (0, 0), logo)
+        else:
+            foto = img.convert("RGB").resize((w, h), Image.LANCZOS)
+            zemin.paste(foto, (0, 0), yuvarlak_maske(w, h, self._s(6)))
+        return zemin
+
+    def _afis_geldi(self, nesil, idx, boyut, img):
+        if nesil != self._nesil or not self._alive:
+            return
+        if boyut != (self.img_w, self.img_h):
+            with self._kilit:
+                self._istenen.discard(idx)
+            self._ciz_planla()
+            return
+        try:
+            foto = ImageTk.PhotoImage(img)
+        except Exception:
+            return
+        self._fotolar[idx] = foto
+        self._fotolar.move_to_end(idx)
+        while len(self._fotolar) > self.FOTO_SINIRI:
+            eski, _ = self._fotolar.popitem(last=False)
+            with self._kilit:
+                self._istenen.discard(eski)
+        ilk, son = self._gorunur
+        if ilk <= idx <= son:
+            self._ciz_planla()
+
+    # ---------------- kaydırma ----------------
+    def yview(self, *args):
+        if not args:
+            return (0.0, 1.0)
+        total = self._toplam_h()
+        h = max(1, self.canvas.winfo_height())
+        if args[0] == "moveto":
+            self._set_offset(float(args[1]) * total)
+        elif args[0] == "scroll":
+            step = self._satir_h() / 2 if args[2] == "units" else h
+            self._set_offset(self._offset + int(args[1]) * step)
+        return None
+
+    def _set_offset(self, value):
+        h = max(1, self.canvas.winfo_height())
+        max_off = max(0, self._toplam_h() - h)
+        value = max(0.0, min(float(value), max_off))
+        if abs(value - self._offset) < 0.5:
+            return
+        self._offset = value
+        self._ciz_planla()
+
+    def _sync_scrollbar(self):
+        total = max(1, self._toplam_h()) if self._items else 1
+        h = max(1, self.canvas.winfo_height())
+        try:
+            if total <= h:
+                self.sb.set(0, 1)
+            else:
+                self.sb.set(self._offset / total, (self._offset + h) / total)
+        except Exception:
+            pass
+
+    def _kok_tekerlek(self, event):
+        if not self._alive or not self._items:
+            return None
+        try:
+            x, y = self.winfo_pointerxy()
+            if self.winfo_containing(x, y) is not self.canvas:
+                return None
+        except Exception:
+            return None
+        num = getattr(event, "num", None)
+        if num == 4:
+            adim = -1.0
+        elif num == 5:
+            adim = 1.0
+        else:
+            adim = -event.delta / 120.0
+        self._set_offset(self._offset + adim * self._satir_h() * 0.5)
+        return "break"
+
+    def _ensure_visible(self, idx):
+        h = max(1, self.canvas.winfo_height())
+        satir_h = self._satir_h()
+        ust = (idx // self.cols) * satir_h
+        if ust < self._offset:
+            self._set_offset(ust)
+        elif ust + satir_h > self._offset + h:
+            self._set_offset(ust + satir_h - h)
+
+    # ---------------- fare / klavye ----------------
+    def _index_at(self, x, y):
+        if not self._items:
+            return -1
+        W = self.canvas.winfo_width()
+        hucre_w = W / self.cols
+        satir_h = self._satir_h()
+        col = int(x // hucre_w)
+        row = int((y + self._offset) // satir_h)
+        if not (0 <= col < self.cols) or row < 0:
+            return -1
+        idx = row * self.cols + col
+        if not (0 <= idx < len(self._items)):
+            return -1
+        x0, y0 = self._kart_konumu(idx, hucre_w, satir_h)
+        if x0 <= x <= x0 + self.card_w and y0 <= y <= y0 + self.card_h:
+            return idx
+        return -1
+
+    def _on_motion(self, event):
+        idx = self._index_at(event.x, event.y)
+        if idx != self._hover:
+            self._hover = idx
+            try:
+                self.canvas.configure(cursor="hand2" if idx >= 0 else "")
+            except Exception:
+                pass
+            self._ciz_planla()
+
+    def _on_leave(self, _event=None):
+        if self._hover != -1:
+            self._hover = -1
+            self._ciz_planla()
+
+    def _on_click_event(self, event):
+        self.canvas.focus_set()
+        idx = self._index_at(event.x, event.y)
+        if idx >= 0:
+            self._on_click(idx)
+
+    def _on_double_event(self, event):
+        idx = self._index_at(event.x, event.y)
+        if idx >= 0:
+            self._on_double(idx)
+
+    def _on_right_event(self, event):
+        idx = self._index_at(event.x, event.y)
+        if idx >= 0:
+            self._on_right(event, idx)
 
     def _on_right(self, event, index):
         self._on_click(index)
@@ -1215,9 +1596,7 @@ class ContentGrid(ctk.CTkFrame):
 
     def _on_click(self, index):
         self._selected = index
-        for i, card in enumerate(self._cards):
-            card.configure(border_width=2 if i == index else 0,
-                           border_color=C["accent"] if i == index else C["panel"])
+        self._ciz_planla()
         if self.on_select and 0 <= index < len(self._items):
             self.on_select(self._items[index], index)
 
@@ -1226,69 +1605,45 @@ class ContentGrid(ctk.CTkFrame):
         if self.on_activate and 0 <= index < len(self._items):
             self.on_activate(self._items[index], index)
 
-    def _load_poster(self, url, index, session, nesil):
-        if nesil != self._nesil or not self._alive:
-            return                      # liste değişti: indirmeye hiç başlama
-        try:
-            # Disk önbelleğinde tek bir "ana" görsel tutuluyor. Kart boyutu
-            # değişince görüntü bundan yeniden ölçekleniyor, yani pencereyi
-            # boyutlandırmak yeniden indirme yapmıyor.
-            dairesel = self.circular
-            if dairesel:
-                path = os.path.join(
-                    POSTER_DIR,
-                    _digest(f"{url}|daire{self.LOGO_MASTER}") + ".png")
-            else:
-                path = os.path.join(
-                    POSTER_DIR,
-                    _digest(f"{url}|ana{self.MASTER_W}x{self.MASTER_H}") + ".jpg")
-            if os.path.exists(path):
-                img = Image.open(path)
-                img.load()
-                if dairesel:
-                    img = img.convert("RGBA")
-            else:
-                resp = session.get(url, timeout=8)
-                resp.raise_for_status()
-                ham = Image.open(io.BytesIO(resp.content))
-                if dairesel:
-                    # Kanal logosu kırpılmaz; daire içine sığdırılır.
-                    img = dairesel_logo(ham, self.LOGO_MASTER, C["panel2"])
-                    img.save(path, "PNG")
-                else:
-                    # Oranı bozmadan kutuyu dolduran kırpma (afişler yamulmuyor)
-                    img = ImageOps.fit(ham.convert("RGB"),
-                                       (self.MASTER_W, self.MASTER_H),
-                                       Image.LANCZOS, centering=(0.5, 0.45))
-                    img.save(path, "JPEG", quality=88)
-            if nesil != self._nesil or not self._alive:
-                return                  # indirme bitti ama liste değişmiş
-            if 0 <= index < len(self._cards):
-                self.after(0, self._apply_poster, index, img, nesil)
-        except Exception:
-            pass
-
-    def _apply_poster(self, index, master, nesil):
-        if nesil != self._nesil:
-            return                      # eski listenin afişi yeni karta yapışmasın
-        if not (self._alive and 0 <= index < len(self._cards)):
-            return
-        try:
-            ctk_img = ctk.CTkImage(light_image=master, dark_image=master,
-                                   size=(self.img_w, self.img_h))
-            self._cards[index]._img_label.configure(image=ctk_img, text="")
-            self._poster_refs[index] = ctk_img
-            self._masters[index] = master
-        except Exception:
-            pass
+    def _on_key(self, event):
+        if not self._items:
+            return None
+        n = len(self._items)
+        sel = self._selected if self._selected >= 0 else 0
+        h = max(1, self.canvas.winfo_height())
+        sayfa = max(1, h // self._satir_h()) * self.cols
+        key = event.keysym
+        if key == "Right":
+            yeni = min(n - 1, sel + 1)
+        elif key == "Left":
+            yeni = max(0, sel - 1)
+        elif key == "Down":
+            yeni = min(n - 1, sel + self.cols)
+        elif key == "Up":
+            yeni = max(0, sel - self.cols)
+        elif key == "Next":
+            yeni = min(n - 1, sel + sayfa)
+        elif key == "Prior":
+            yeni = max(0, sel - sayfa)
+        elif key == "Home":
+            yeni = 0
+        elif key == "End":
+            yeni = n - 1
+        elif key == "Return" and self._selected >= 0:
+            self._on_double(self._selected)
+            return "break"
+        else:
+            return None
+        self._ensure_visible(yeni)
+        self._on_click(yeni)
+        return "break"
 
     def destroy(self):
         self._alive = False
         self._nesil += 1
-        havuz_kapat(self._pool)
         super().destroy()
 
-# ============================== DETAY PANELİ ==============================
+
 def _metin(value, limit=0):
     if value is None:
         return ""
@@ -1750,7 +2105,7 @@ class DetailPanel:
                 if dairesel:
                     img = img.convert("RGBA")
             else:
-                resp = self.session.get(url, timeout=10)
+                resp = afis_indir(self.session, url, 10)
                 resp.raise_for_status()
                 ham = Image.open(io.BytesIO(resp.content))
                 if dairesel:
@@ -1766,13 +2121,13 @@ class DetailPanel:
             pass
 
     def _ui(self, fn, *args):
-        """İş parçacığından arayüze güvenli geçiş."""
-        if not (self._alive and self._pencere_var()):
-            return
-        try:
-            self.win.after(0, lambda: fn(*args))
-        except Exception:
-            pass
+        """İş parçacığından arayüze güvenli geçiş (kuyruk üzerinden)."""
+        if self._alive:
+            ui_cagir(self._ui_calistir, fn, args)
+
+    def _ui_calistir(self, fn, args):
+        if self._alive and self._pencere_var():
+            fn(*args)
 
     def _apply_poster(self, token, master, olcu):
         if token != self._token or not self._alive or not self._pencere_var():
@@ -1830,7 +2185,7 @@ class PosterLoader:
                     image = Image.open(path)
                     image.load()
                 else:
-                    resp = self.session.get(url, timeout=6)
+                    resp = afis_indir(self.session, url, 6)
                     resp.raise_for_status()
                     buf = Image.open(io.BytesIO(resp.content))
                     try:
@@ -1844,10 +2199,7 @@ class PosterLoader:
                 self._remember(url, image)
             except Exception:
                 image = None
-            try:
-                self.root.after(0, callback, token, image)
-            except Exception:
-                pass
+            ui_cagir(callback, token, image)
 
 # ============================== PARÇA ETİKETLERİ ==============================
 # IPTV akışlarında dil kodları çoğunlukla ISO 639 (tur/tr/eng/en) gelir.
@@ -1986,7 +2338,7 @@ class PlayerWindow:
     TRACK_OFF = "Kapalı"
 
     def __init__(self, master, source, title, backend, settings, on_close=None,
-                 mevcut_pencere=None):
+                 mevcut_pencere=None, baslangic_gecikmesi=50):
         self.master = master
         self.source = dict(source)
         self.kind = source.get("kind", "vod")
@@ -2042,6 +2394,10 @@ class PlayerWindow:
         self._ag_sonuc = None         # (zaman, internet var mı)
         self._ag_yoklaniyor = False
         self._ag_son_yoklama = 0.0
+        self._ozellik = {}            # mpv özellik önbelleği (gözlemciler doldurur)
+        self._parca_imzasi = None
+        self._parca_planli = False
+        self._son_otomatik = 0.0      # son otomatik kalite/tampon değişikliği
         self._ended = False
         self._file_loaded = False
         self._last_mouse = 0.0
@@ -2064,7 +2420,10 @@ class PlayerWindow:
         self._bind_keys()
         self.win.update_idletasks()
         bring_to_front(self.win)
-        self.win.after(50, self.start)
+        if baslangic_gecikmesi > 300:
+            # Önceki yayın yeni kapatıldı: sağlayıcı bağlantıyı bıraksın.
+            self.overlay.configure(text="Önceki yayın kapatılıyor…")
+        self.win.after(max(50, int(baslangic_gecikmesi)), self.start)
 
     def _pencereyi_hazirla(self, master, mevcut):
         """Verilen pencereyi temizleyip yeniden kullanır; yoksa yenisini açar."""
@@ -2302,10 +2661,35 @@ class PlayerWindow:
     def _prop_name(name):
         return name.replace("-", "_")
 
+    # Sık okunan özellikler mpv'ye her seferinde sorulmaz; gözlemcilerle
+    # önbelleğe alınır. Eskiden _tick her 250 ms'de ana iş parçacığından
+    # 10–25 eşzamanlı okuma yapıyordu; mpv meşgulken arayüz (ve gömülü
+    # görüntü penceresi) takılıyordu.
+    GOZLENEN = ("pause", "paused-for-cache", "idle-active", "core-idle",
+                "time-pos", "duration", "demuxer-cache-time",
+                "demuxer-cache-duration", "dwidth", "dheight", "container-fps",
+                "video-codec", "video-bitrate", "audio-bitrate",
+                "frame-drop-count", "decoder-frame-drop-count",
+                "hwdec-current", "track-list", "aid", "sid", "vid",
+                "volume", "mute")
+    _GOZLENEN_KUME = frozenset(GOZLENEN)
+
+    def _ozellikleri_gozle(self):
+        for ad in self.GOZLENEN:
+            def geri(_n=None, deger=None, ad=ad):
+                self._ozellik[ad] = deger
+            try:
+                self.mpv.observe_property(ad, geri)
+            except Exception as e:
+                print(f"'{ad}' gözlenemedi: {e}")
+
     def _get(self, name, default=None):
         player = self.mpv
         if player is None:
             return default
+        if name in self._GOZLENEN_KUME:
+            value = self._ozellik.get(name)
+            return default if value is None else value
         try:
             value = getattr(player, self._prop_name(name))
         except Exception:
@@ -2318,6 +2702,8 @@ class PlayerWindow:
             return False
         try:
             setattr(player, self._prop_name(name), value)
+            if name in self._GOZLENEN_KUME:
+                self._ozellik[name] = value
             return True
         except Exception:
             return False
@@ -2378,17 +2764,19 @@ class PlayerWindow:
                 break
             except Exception:
                 continue
+        self._ozellikleri_gozle()
         self._register_input()
         self._parca_gozlemcileri()
         return True
 
     def _ui(self, fn, *args):
-        if self._closed:
-            return
-        try:
-            self.win.after(0, lambda: fn(*args))
-        except Exception:
-            pass
+        """mpv iş parçacığından arayüze geçiş (kuyruk üzerinden)."""
+        if not self._closed:
+            ui_cagir(self._ui_calistir, fn, args)
+
+    def _ui_calistir(self, fn, args):
+        if not self._closed:
+            fn(*args)
 
     def _register_input(self):
         actions = {
@@ -2520,6 +2908,7 @@ class PlayerWindow:
             self._notice_until = 0
             self._opened_at = time.time()
             self._tracks_ready = False
+            self._parca_imzasi = None
             self._track_tries = 0
             self._audio_map = {}
             self._sub_map = {}
@@ -2541,7 +2930,8 @@ class PlayerWindow:
         if message:
             self.notice(message, 4)
         self._cmd("stop")
-        self.win.after(80, lambda: self.start(resume_to=position))
+        # Tek bağlantılı hesaplarda anında yeniden bağlanma reddedilebiliyor.
+        self.win.after(600, lambda: self.start(resume_to=position))
 
     @staticmethod
     def _to_ms(value):
@@ -2554,29 +2944,13 @@ class PlayerWindow:
             return None
 
     def position_ms(self):
-        for name in ("time-pos", "playback-time"):
-            ms = self._to_ms(self._get(name))
-            if ms is not None:
-                self._position_ms = ms
-                return ms
-        # konum okunamadıysa yüzdeden türet
-        if self._duration_ms > 0:
-            try:
-                pct = self._get("percent-pos")
-                if pct is not None:
-                    self._position_ms = int(self._duration_ms * float(pct) / 100.0)
-            except Exception:
-                pass
+        ms = self._to_ms(self._get("time-pos"))
+        if ms is not None:
+            self._position_ms = ms
         return self._position_ms
 
     def duration_ms(self):
         ms = self._to_ms(self._get("duration")) or 0
-        if ms <= 0:
-            # bazı akışlarda duration boş gelir: kalan + geçen ile tahmin et
-            remaining = self._to_ms(self._get("time-remaining"))
-            current = self._to_ms(self._get("time-pos"))
-            if remaining is not None and current is not None:
-                ms = remaining + current
         if ms <= 0:
             ms = self._to_ms(self._get("demuxer-cache-time")) or 0
             if ms and self._position_ms and ms < self._position_ms:
@@ -2803,6 +3177,12 @@ class PlayerWindow:
             print(f"Parça listesi okunamadı: {e}")
             return False
 
+        imza = repr((sorted(sesler.items()), sorted(altyazilar.items()),
+                     sorted(goruntuler.items()), self._get("aid"),
+                     self._get("sid"), self._get("vid")))
+        if imza == self._parca_imzasi:
+            return self._tracks_ready      # değişiklik yok: menülere dokunma
+        self._parca_imzasi = imza
         self._audio_map = sesler
         self._sub_map = altyazilar
         self._video_map = goruntuler
@@ -2848,13 +3228,27 @@ class PlayerWindow:
             return
         def yap(ad):
             def geri(_n=None, _d=None):
-                self._ui(self.refresh_tracks)
+                # Açılışta peş peşe gelen olaylar tek yenilemede birleştirilir.
+                if self._parca_planli:
+                    return
+                self._parca_planli = True
+                self._ui(self._parca_tazele_planla)
             return geri
         for ozellik in ("track-list", "aid", "sid", "vid"):
             try:
                 self.mpv.observe_property(ozellik, yap(ozellik))
             except Exception as e:
                 print(f"'{ozellik}' izlenemedi: {e}")
+
+    def _parca_tazele_planla(self):
+        try:
+            self.win.after(300, self._parca_tazele_simdi)
+        except Exception:
+            self._parca_planli = False
+
+    def _parca_tazele_simdi(self):
+        self._parca_planli = False
+        self.refresh_tracks()
 
     def on_audio_change(self, label):
         if label in (self.TRACK_OFF, "Ses yok", "Yok"):
@@ -3014,20 +3408,20 @@ class PlayerWindow:
     def _read_stats(self):
         parts = []
         try:
-            width = self._get("dwidth") or self._get("width")
-            height = self._get("dheight") or self._get("height")
+            width = self._get("dwidth")
+            height = self._get("dheight")
             try:
                 if width and height:
                     parts.append(f"{int(width)}×{int(height)}")
             except Exception:
                 pass
-            fps = self._get("estimated-vf-fps") or self._get("container-fps")
+            fps = self._get("container-fps")
             try:
                 if fps and float(fps) > 0:
                     parts.append(f"{float(fps):.0f} fps")
             except Exception:
                 pass
-            codec = self._get("video-codec") or self._get("video-format")
+            codec = self._get("video-codec")
             if codec:
                 parts.append(str(codec).upper()[:12])
             total = 0.0
@@ -3101,12 +3495,17 @@ class PlayerWindow:
 
     def _handle_stall(self):
         now = time.time()
-        if now - self._stall_since > 90:
+        if now - self._stall_since > 120:
             self._stalls = 0
             self._stall_since = now
         self._stalls += 1
-        if self._stalls < 3 or not self.settings.get("auto_downgrade", True):
+        # 2 dk içinde 4 takılma + son otomatik değişiklikten 90 sn geçmiş olmalı.
+        # Her yeniden bağlanma birkaç saniye siyah ekran demek.
+        if self._stalls < 4 or not self.settings.get("auto_downgrade", True):
             return
+        if now - self._son_otomatik < 90:
+            return
+        self._son_otomatik = now
         self._stalls = 0
         self._stall_since = now
         if self.is_live and self._kalite_dusur():
@@ -4106,6 +4505,7 @@ class IPTVApp:
         self.config = load_config()
         self.favorites = load_favorites()
         self.settings = load_settings()
+        ui_pompasini_baslat(self.root)
         self.posters = PosterLoader(self.root, self.session)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         threading.Thread(target=self._init_player, daemon=True).start()
@@ -4176,10 +4576,11 @@ class IPTVApp:
 
     def ui(self, fn, *args):
         if self.alive:
-            try:
-                self.root.after(0, fn, *args)
-            except Exception:
-                pass
+            ui_cagir(self._ui_calistir, fn, args)
+
+    def _ui_calistir(self, fn, args):
+        if self.alive:
+            fn(*args)
 
     def show_login(self):
         for widget in self.root.winfo_children():
@@ -4747,6 +5148,17 @@ class IPTVApp:
         return json.loads(raw)
 
     def _open_player(self, source, title):
+        # Tek oynatıcı kuralı: çoğu Xtream hesabı tek bağlantıya izin verir.
+        # Eskiden yeni kanal açılınca eski pencere de yayını çekmeye devam
+        # ediyordu; sağlayıcı bağlantılardan birini kesince ikisi de takılıyordu.
+        gecikme = 50
+        for eski in list(self.players):
+            try:
+                eski.close()
+            except Exception:
+                pass
+            gecikme = 1500          # sunucunun eski bağlantıyı bırakması için
+        self.players = []
         # Önizleme penceresi açıksa üçüncü pencere yerine onu kullan.
         devralinan = None
         panel = getattr(self, "detail", None)
@@ -4754,12 +5166,16 @@ class IPTVApp:
             devralinan = panel.pencereyi_devret()
         player = PlayerWindow(self.root, source, title, mpv, self.settings,
                               on_close=self._player_closed,
-                              mevcut_pencere=devralinan)
+                              mevcut_pencere=devralinan,
+                              baslangic_gecikmesi=gecikme)
         self.players.append(player)
+        OYNATMA_AKTIF.set()
 
     def _player_closed(self, player):
         if player in self.players:
             self.players.remove(player)
+        if not self.players:
+            OYNATMA_AKTIF.clear()
 
     def _open_series(self, series_name, info):
         episodes = (info or {}).get("episodes") or {}
@@ -4812,17 +5228,30 @@ class IPTVApp:
             cover_label = ctk.CTkLabel(cover_frame, text="", width=160, height=240)
             cover_label.pack(padx=10, pady=10)
 
-            def load_cover():
+            def kapagi_uygula(img):
                 try:
-                    resp = self.session.get(series_cover, timeout=6)
-                    resp.raise_for_status()
-                    img = Image.open(io.BytesIO(resp.content))
-                    img.thumbnail((160, 240), Image.BILINEAR)
+                    if not cover_label.winfo_exists():
+                        return
+                    if img is None:
+                        cover_label.configure(text="Kapak\nyüklenemedi")
+                        return
                     ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
                     cover_label.configure(image=ctk_img, text="")
                     cover_label.image = ctk_img
                 except Exception:
-                    cover_label.configure(text="Kapak\nyüklenemedi")
+                    pass
+
+            def load_cover():
+                img = None
+                try:
+                    resp = afis_indir(self.session, series_cover, 6)
+                    resp.raise_for_status()
+                    img = Image.open(io.BytesIO(resp.content))
+                    img.load()
+                    img.thumbnail((160, 240), Image.BILINEAR)
+                except Exception:
+                    img = None
+                ui_cagir(kapagi_uygula, img)
 
             threading.Thread(target=load_cover, daemon=True).start()
 
@@ -4939,10 +5368,7 @@ class IPTVApp:
                 pass
         grid = getattr(self, "content_grid", None)
         if grid is not None:
-            try:
-                havuz_kapat(grid._pool)
-            except Exception:
-                pass
+            grid._alive = False          # afiş işçileri kendiliğinden durur
         if self.library:
             self.library.shutdown()
         try:
