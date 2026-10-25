@@ -1,0 +1,19 @@
+# Beyaz liste: sadece asagidaki dosyalar GitHub'a gider.
+# Giris bilgileri (config.json, notlar), libmpv DLL, derleme ciktilari ve
+# yedekler bu sayede asla yuklenmez.
+/*
+!/.gitignore
+!/.gitattributes
+!/.github/
+!/iptv.py
+!/KrersnStudio.spec
+!/requirements.txt
+!/derle.ps1
+!/sifirla.ps1
+!/yukle.ps1
+!/surum_yayinla.ps1
+!/krersn.ico
+!/krersn.png
+!/README.md
+!/LICENSE
+__pycache__/

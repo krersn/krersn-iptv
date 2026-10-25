@@ -7,12 +7,15 @@ Windows için hızlı, sade bir **Xtream Codes** IPTV oynatıcısı. Python + li
 
 ## Özellikler
 
-- Canlı TV, film ve dizi kategorileri; afişli ızgara görünüm
+- Canlı TV, film ve dizi kategorileri; binlerce içerikte bile akıcı afişli ızgara
 - libmpv tabanlı oynatıcı: donanım hızlandırma, ses/altyazı parçası seçimi, gecikme ayarı
-- İnternet koptuğunda otomatik yeniden bağlanma (filmde kaldığı yerden devam)
-- Yayın açılmazsa biçim / uzantı / tampon alternatiflerini sırayla dener
+- Film ve dizilerde **kaldığı yerden devam** (1 dk'dan uzun izlenen içerikler)
+- İnternet koptuğunda otomatik yeniden bağlanma; internet gelince kendiliğinden devam
+- Sağlayıcı bağlantı sınırı doluysa (401/403/409/509) uyarı verip aralıklı yeniden dener
+- Yayın açılmazsa biçim (TS/HLS) ya da uzantı alternatiflerini sırayla dener
 - Bağlantı zayıfsa kaliteyi otomatik düşürme
 - Favoriler, önbellek, klavye kısayolları
+- Sorun kaydı: `%USERPROFILE%\.iptv_panel\iptv_gunluk.txt` (kullanıcı adı/parola gizlenir)
 
 ## İndirme
 

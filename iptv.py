@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import queue
+import re
 import socket
 import sys
 import tempfile
@@ -54,6 +55,47 @@ def ui_pompasini_baslat(root):
         except Exception:
             pass
     root.after(15, pompa)
+
+# ============================== GÜNLÜK (LOG) ==============================
+# Sorun anında ne olduğunu sonradan görebilmek için: %USERPROFILE%\.iptv_panel\iptv_gunluk.txt
+# Kullanıcı adı / parola adreslerden maskelenir.
+_GUNLUK_KILIDI = threading.Lock()
+_GUNLUK_SON = {"metin": "", "tekrar": 0}
+_MASKE_DESENLERI = (
+    (re.compile(r"(/(?:live|movie|series)/)[^/\s]+/[^/\s]+/"), r"\1***/***/"),
+    (re.compile(r"((?:username|password)=)[^&\s]+"), r"\1***"),
+)
+
+def gunluk_yolu():
+    return os.path.join(APP_DIR, "iptv_gunluk.txt")
+
+def gunluk(metin):
+    try:
+        metin = str(metin).replace("\n", " ").strip()
+        for desen, yerine in _MASKE_DESENLERI:
+            metin = desen.sub(yerine, metin)
+        with _GUNLUK_KILIDI:
+            if metin == _GUNLUK_SON["metin"]:
+                _GUNLUK_SON["tekrar"] += 1          # aynı satır art arda: sadece say
+                return
+            yol = gunluk_yolu()
+            satirlar = []
+            if _GUNLUK_SON["tekrar"]:
+                satirlar.append(f"    (önceki satır {_GUNLUK_SON['tekrar']} kez tekrarlandı)")
+            _GUNLUK_SON["metin"], _GUNLUK_SON["tekrar"] = metin, 0
+            satirlar.append(time.strftime("%Y-%m-%d %H:%M:%S ") + metin)
+            try:
+                if os.path.getsize(yol) > 2 * 1024 * 1024:   # 2 MB'ı geçince yarıla
+                    with open(yol, "r", encoding="utf-8", errors="ignore") as f:
+                        eski = f.read()
+                    with open(yol, "w", encoding="utf-8") as f:
+                        f.write(eski[len(eski) // 2:])
+            except OSError:
+                pass
+            with open(yol, "a", encoding="utf-8") as f:
+                f.write("\n".join(satirlar) + "\n")
+    except Exception:
+        pass
 
 # Oynatma sürerken afiş indirmeleri tek tek ve aralıklı yapılır; yayının
 # bant genişliği afişlere gitmez.
@@ -425,6 +467,7 @@ POSTER_DIR = os.path.join(APP_DIR, "posters")
 # Göreli yol KULLANILMIYOR: çalışma klasörü yazılabilir olmayabilir.
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 FAV_FILE = os.path.join(APP_DIR, "favorites.json")
+IZLEME_FILE = os.path.join(APP_DIR, "izleme.json")   # film/dizi kaldığı yerler
 # Eski sürümlerin çalışma klasörüne bıraktığı dosyalar (sadece okunur, taşınır)
 LEGACY_CONFIG = os.path.abspath("config.json")
 LEGACY_FAV = os.path.abspath("favorites.json")
@@ -646,6 +689,71 @@ def fmt_time(ms):
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+# ============================== KALDIĞI YER ==============================
+_IZLEME = None
+_IZLEME_KILIDI = threading.Lock()
+_IZLEME_YAZMA_KILIDI = threading.Lock()   # disk yazımı ayrı: arayüz beklemesin
+IZLEME_SINIRI = 300          # en fazla bu kadar içerik hatırlanır
+DEVAM_EN_AZ_MS = 60_000      # 1 dk'dan az izlenenler için sorulmaz
+DEVAM_SON_PAYI_MS = 90_000   # son 1,5 dk'ya gelinmişse "bitti" sayılır
+
+def _izleme():
+    global _IZLEME
+    if _IZLEME is None:
+        veri = _json_oku(IZLEME_FILE) if os.path.exists(IZLEME_FILE) else None
+        _IZLEME = veri if isinstance(veri, dict) else {}
+    return _IZLEME
+
+def izleme_anahtari(source):
+    """Film/dizi bölümü için kalıcı anahtar (sunucu + tür + id); canlı yayında None."""
+    tur = source.get("kind")
+    if tur not in ("vod", "series") or not source.get("id"):
+        return None
+    sunucu = urlsplit(str(source.get("base") or "")).netloc
+    return f"{sunucu}|{tur}|{source.get('id')}"
+
+def izleme_konumu(anahtar):
+    """Devam edilebilecek konum (ms); yoksa 0."""
+    if not anahtar:
+        return 0
+    with _IZLEME_KILIDI:
+        kayit = _izleme().get(anahtar) or {}
+    konum = int(kayit.get("konum") or 0)
+    sure = int(kayit.get("sure") or 0)
+    if konum < DEVAM_EN_AZ_MS:
+        return 0
+    if sure > 0 and konum >= sure - DEVAM_SON_PAYI_MS:
+        return 0
+    return konum
+
+def _izleme_diske_yaz():
+    def yaz(kopya):
+        with _IZLEME_YAZMA_KILIDI:
+            _json_yaz(IZLEME_FILE, kopya, indent=0, ensure_ascii=False)
+    with _IZLEME_KILIDI:
+        kopya = dict(_izleme())
+    threading.Thread(target=yaz, args=(kopya,), daemon=True).start()
+
+def izleme_kaydet(anahtar, konum_ms, sure_ms, baslik=""):
+    if not anahtar:
+        return
+    with _IZLEME_KILIDI:
+        veri = _izleme()
+        veri[anahtar] = {"konum": int(konum_ms), "sure": int(sure_ms or 0),
+                         "baslik": str(baslik)[:120], "t": int(time.time())}
+        if len(veri) > IZLEME_SINIRI:
+            for eski in sorted(veri, key=lambda k: veri[k].get("t", 0))[:len(veri) - IZLEME_SINIRI]:
+                veri.pop(eski, None)
+    _izleme_diske_yaz()
+
+def izleme_sil(anahtar):
+    if not anahtar:
+        return
+    with _IZLEME_KILIDI:
+        silindi = _izleme().pop(anahtar, None) is not None
+    if silindi:
+        _izleme_diske_yaz()
 
 # ============================== AYARLAR / KALİTE ==============================
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
@@ -2345,6 +2453,9 @@ class PlayerWindow:
         self.is_live = self.kind == "live"
         self.settings = dict(settings)
         self.quality = self.settings.get("quality", "auto")
+        self._asil = {"live_protocol": self.settings.get("live_protocol", "auto"),
+                      "ext": self.source.get("ext"), "quality": self.quality}
+        self._yavas_bildirildi = False
         self.backend = backend
         self.on_close = on_close
         self.mpv = None
@@ -2398,6 +2509,17 @@ class PlayerWindow:
         self._parca_imzasi = None
         self._parca_planli = False
         self._son_otomatik = 0.0      # son otomatik kalite/tampon değişikliği
+        self._son_sunucu_hatasi = None  # (zaman, mpv mesajı)
+        self._hesap = None            # (zaman, bilgi sözlüğü ya da None)
+        self._hesap_soruluyor = False
+        self._hesap_bekleme_an = 0.0  # bağlantı sınırı mesajının son gösterimi
+        self._limit_bas_an = 0.0      # bağlantı sınırı beklemesinin başladığı an
+        self._limit_son_deneme = 0.0
+        self._izleme_anahtari = izleme_anahtari(self.source)
+        self._izleme_son_kayit = 0.0
+        self._devam_kutusu = None
+        self._devam_konum = 0
+        self._baslik = title
         self._ended = False
         self._file_loaded = False
         self._last_mouse = 0.0
@@ -2423,7 +2545,78 @@ class PlayerWindow:
         if baslangic_gecikmesi > 300:
             # Önceki yayın yeni kapatıldı: sağlayıcı bağlantıyı bıraksın.
             self.overlay.configure(text="Önceki yayın kapatılıyor…")
-        self.win.after(max(50, int(baslangic_gecikmesi)), self.start)
+        self.win.after(max(50, int(baslangic_gecikmesi)), self._baslangic)
+
+    # ---------------------- KALDIĞI YERDEN DEVAM ----------------------
+    def _baslangic(self):
+        if self._closed:
+            return
+        konum = 0 if self.is_live else izleme_konumu(self._izleme_anahtari)
+        if konum <= 0:
+            self.start()
+            return
+        self._devam_konum = konum
+        self.overlay.place_forget()
+        kutu = ctk.CTkFrame(self.video_frame, fg_color=C["panel"], corner_radius=12)
+        ctk.CTkLabel(kutu, text="Bu içeriği daha önce izlediniz", font=ui_font(15, "bold"),
+                     text_color=C["text"]).pack(padx=28, pady=(20, 4))
+        ctk.CTkLabel(kutu, text=f"Kaldığınız yer: {fmt_time(konum)}", font=ui_font(12),
+                     text_color=C["muted"]).pack(padx=28, pady=(0, 16))
+        satir = ctk.CTkFrame(kutu, fg_color="transparent")
+        satir.pack(padx=22, pady=(0, 20))
+        ctk.CTkButton(satir, text="▶  Kaldığı yerden devam et", height=38, width=210,
+                      font=ui_font(12, "bold"), fg_color=C["accent"],
+                      hover_color=C["accent_dk"], text_color="#111111", corner_radius=8,
+                      command=lambda: self._devam_sec(konum)).pack(side="left", padx=6)
+        ctk.CTkButton(satir, text="Baştan başla", height=38, width=130, font=ui_font(12),
+                      fg_color=C["panel2"], hover_color=C["line"], text_color=C["text"],
+                      corner_radius=8,
+                      command=lambda: self._devam_sec(0)).pack(side="left", padx=6)
+        kutu.place(relx=0.5, rely=0.5, anchor="center")
+        self._devam_kutusu = kutu
+        self.btn_play.configure(text="▶")
+        self.win.bind("<Return>", lambda e: self._devam_sec(konum))
+
+    def _devam_sec(self, konum_ms):
+        """Kullanıcı seçti: kutuyu kaldır, seçilen konumdan oynat."""
+        if self._devam_kutusu is None or self._closed:
+            return
+        try:
+            self._devam_kutusu.destroy()
+        except Exception:
+            pass
+        self._devam_kutusu = None
+        try:
+            self.win.unbind("<Return>")
+        except Exception:
+            pass
+        self.overlay.configure(text="Bağlanıyor…")
+        self.overlay.place(relx=0.5, rely=0.5, anchor="center")
+        self.start(resume_to=konum_ms)
+
+    def _izleme_guncelle(self, state):
+        """Film/dizide konumu 15 sn'de bir kaydeder; gerçekten bittiyse siler."""
+        if self.is_live or not self._izleme_anahtari:
+            return
+        if state == "ended" and self._gercek_son_mu(state):
+            izleme_sil(self._izleme_anahtari)
+            return
+        if state != "playing":
+            return
+        now = time.time()
+        if now - self._izleme_son_kayit < 15:
+            return
+        self._izleme_son_kayit = now
+        izleme_kaydet(self._izleme_anahtari, self._position_ms, self._duration_ms, self._baslik)
+
+    def _izleme_kapanista(self):
+        if self.is_live or not self._izleme_anahtari or not self._played_any:
+            return
+        konum, sure = self._position_ms, self._duration_ms
+        if sure > 0 and konum >= sure - DEVAM_SON_PAYI_MS:
+            izleme_sil(self._izleme_anahtari)
+        elif konum > 0:
+            izleme_kaydet(self._izleme_anahtari, konum, sure, self._baslik)
 
     def _pencereyi_hazirla(self, master, mevcut):
         """Verilen pencereyi temizleyip yeniden kullanır; yoksa yenisini açar."""
@@ -2743,7 +2936,9 @@ class PlayerWindow:
             ytdl="no",
             audio_client_name=APP_NAME,
             title=APP_NAME,
-            msg_level="all=no",
+            msg_level="all=warn",
+            log_handler=self._mpv_gunluk,
+            loglevel="warn",
         )
         if platform.system() == "Windows":
             base["gpu_context"] = "d3d11"
@@ -2768,6 +2963,15 @@ class PlayerWindow:
         self._register_input()
         self._parca_gozlemcileri()
         return True
+
+    def _mpv_gunluk(self, seviye, bilesen, mesaj):
+        """mpv iş parçacığında çalışır: yalnızca dosyaya yazar."""
+        mesaj = str(mesaj).strip()
+        gunluk(f"mpv[{seviye}] {bilesen}: {mesaj}")
+        kucuk = mesaj.lower()
+        if any(k in kucuk for k in ("http error", "403", "401", "404", "509",
+                                    "forbidden", "unauthorized", "too many")):
+            self._son_sunucu_hatasi = (time.time(), mesaj)
 
     def _ui(self, fn, *args):
         """mpv iş parçacığından arayüze geçiş (kuyruk üzerinden)."""
@@ -2848,6 +3052,7 @@ class PlayerWindow:
             code = int(raw)
         except (TypeError, ValueError):
             return
+        gunluk(f"mpv dosya sonu: neden={raw}")
         if code == self._END_ERROR:
             self._end_error = True
         elif code == self._END_EOF:
@@ -2883,10 +3088,12 @@ class PlayerWindow:
             if not self._ensure_player():
                 return
             self.url = build_url(self.source, self.quality, self.settings)
+            gunluk(f"BAŞLAT {self.kind} kalite={self.quality} ek_tampon={self.extra_buffer} {self.url}")
             self._end_error = False
             self._ended = False
             self._file_loaded = False
             self._acildi = False
+            self._yavas_bildirildi = False
             self._apply_options()
             self._set("pause", False)
             self._set("volume", self.volume)
@@ -2924,6 +3131,7 @@ class PlayerWindow:
             self.overlay.configure(text=f"Başlatılamadı: {e}")
 
     def reload(self, keep_position=True, message=None):
+        gunluk(f"YENİDEN YÜKLE: {message or '-'}")
         position = 0
         if keep_position and not self.is_live:
             position = self.position_ms()
@@ -3003,14 +3211,19 @@ class PlayerWindow:
         if code == self.quality:
             return
         self.quality = code
+        self._asil["quality"] = code
         self._stalls = 0
         self._zincir_sifirla()
         self.reload(message=f"{label} kaliteye geçiliyor…")
 
     def play_pause(self):
         try:
+            if self._devam_kutusu is not None:
+                self._devam_sec(self._devam_konum)
+                return
             if self._basarisiz:
                 self._zincir_sifirla()
+                self._asil_ayarlara_don()
                 self.overlay.configure(text_color=C["muted"])
                 self.notice("Yeniden deneniyor…", 3)
                 self.start()
@@ -3557,27 +3770,40 @@ class PlayerWindow:
         kadar 'alternatif deneniyor' yazıyordu. Artık liste bitince net bir
         hata ekranı gösterilip döngü durduruluyor.
         """
+        # Ön yükleme artırmak ve kalite düşürmek açılışa yardım etmez (tampon
+        # büyüyünce açılış daha da gecikir); bunlar yalnızca takılmada kullanılır.
+        # Son adım asıl biçimin bir kez daha denenmesi: geçici sunucu hataları için.
         stratejiler = []
         if self.is_live:
             simdiki_hls = str(self.url or "").endswith(".m3u8")
-            once, sonra = ("ts", "hls") if simdiki_hls else ("hls", "ts")
-            stratejiler.append((f"{once.upper()} biçimi",
-                                lambda p=once: self._protokol_ayarla(p)))
-            stratejiler.append(("daha fazla ön yükleme",
-                                lambda: self._tampon_arttir(4000)))
-            stratejiler.append((f"{sonra.upper()} biçimi + tampon",
-                                lambda p=sonra: (self._protokol_ayarla(p)
-                                                 and self._tampon_arttir(4000))))
-            stratejiler.append(("düşük kalite", self._kalite_dusur))
+            diger, asil = ("ts", "hls") if simdiki_hls else ("hls", "ts")
+            stratejiler.append((f"{diger.upper()} biçimi",
+                                lambda p=diger: self._protokol_ayarla(p)))
+            stratejiler.append((f"{asil.upper()} biçimi (tekrar)",
+                                lambda p=asil: self._protokol_ayarla(p)))
         else:
+            asil_uzanti = self.source.get("ext")
             for uzanti in self._uzanti_adaylari()[:3]:
                 stratejiler.append((f".{uzanti} uzantısı",
                                     lambda u=uzanti: self._uzanti_ayarla(u)))
-            stratejiler.append(("daha fazla ön yükleme",
-                                lambda: self._tampon_arttir(4000)))
+            if asil_uzanti:
+                stratejiler.append((f".{asil_uzanti} uzantısı (tekrar)",
+                                    lambda u=asil_uzanti: self._uzanti_ayarla(u)))
         self._stratejiler = stratejiler
         self._deneme = 0
         self._denenenler = []
+
+    def _asil_ayarlara_don(self):
+        """Kurtarma adımlarının değiştirdiği biçim/uzantı/tampon/kaliteyi geri al."""
+        self.settings["live_protocol"] = self._asil["live_protocol"]
+        self.source["ext"] = self._asil["ext"]
+        self.extra_buffer = 0
+        if self.quality != self._asil["quality"]:
+            self.quality = self._asil["quality"]
+            try:
+                self.quality_menu.set(QUALITY_NAMES.get(self.quality, "Otomatik"))
+            except Exception:
+                pass
 
     def _zincir_sifirla(self):
         """Kullanıcı elle tekrar denediğinde kurtarma listesini başa al."""
@@ -3590,6 +3816,7 @@ class PlayerWindow:
         self._kopma_an = 0.0
         self._kopma_deneme = 0
         self._son_kopma_deneme = 0.0
+        self._limit_bas_an = 0.0
 
     def _watchdog(self, state):
         if state in ("playing", "paused"):
@@ -3603,20 +3830,65 @@ class PlayerWindow:
             # aynı yayına yeniden bağlan.
             self._kopma_kurtar(state)
             return
-        bekleyen = time.time() - self._opened_at
-        taninan = self._acilma_suresi()
-        if bekleyen < taninan:
-            # Süre dolmadan alternatif denenmez. Hata gelse bile bekleriz:
-            # sunucu ilk saniyelerde hata döndürüp sonra akışa başlayabiliyor,
-            # ayrıca hızlı ardışık bağlantılar sağlayıcıyı kilitliyor.
-            if state == "error":
-                kalan = max(0, int(taninan - bekleyen))
-                self._geri_sayim_goster(kalan)
+        now = time.time()
+        bekleyen = now - self._opened_at
+        hata = state == "error"
+        # Denemeler arasında en az birkaç saniye: sağlayıcıyı art arda
+        # bağlantıyla yormamak için (yeniden yüklemenin 0,6 sn'lik boşluğu dahil).
+        if now - self._son_deneme_an < self._HATA_BEKLEME:
             return
-        if time.time() - self._son_deneme_an < taninan:
+        if hata:
+            # Kesin hata: tam süreyi beklemeye gerek yok.
+            if bekleyen < self._HATA_BEKLEME:
+                return
+        else:
+            # Hata yok, sadece yavaş: biçim değiştirmek açılmak üzere olan
+            # yayını keser. Önce daha uzun bekle.
+            if bekleyen < self._acilma_suresi():
+                return
+            sinir = self._yavas_siniri()
+            if bekleyen < sinir:
+                if not self._yavas_bildirildi:
+                    self._yavas_bildirildi = True
+                    gunluk("açılış yavaş: bekleniyor")
+                    self.notice("Sunucu yavaş yanıt veriyor — bekleniyor…",
+                                max(3, int(sinir - bekleyen)))
+                return
+        sunucu = self._bu_denemenin_hatasi()
+        if hata and self._yetki_hatasi_mi(sunucu):
+            # 401/403/509: biçim değiştirmek işe yaramaz. Sebep bağlantı
+            # limitiyse bekleyip aynı ayarlarla tekrar dene; değilse dur.
+            if self._yetki_reddi(now):
+                return
+            gunluk(f"sunucu erişimi reddetti: {sunucu}")
+            self._denenenler.append("sunucu erişimi reddetti")
+            self._yayin_basarisiz()
             return
-        sebep = "Yayın açılmadı" if state == "error" else "Yayın geç açılıyor"
+        sebep = "Yayın açılmadı" if hata else "Yayın çok geç açılıyor"
+        gunluk(f"açılış sorunu: {sebep} sunucu={sunucu}")
+        self._hesap = None
         self._try_fallback(sebep)
+
+    _HATA_BEKLEME = 3.5   # kesin hatada sonraki adıma geçmeden önce (sn)
+
+    def _yavas_siniri(self):
+        """Hata gelmeden yavaş açılan akışa tanınan toplam süre (sn)."""
+        return max(25, min(60, self._acilma_suresi() * 2.5))
+
+    def _bu_denemenin_hatasi(self):
+        """Bu açılış denemesi sırasında mpv'nin bildirdiği sunucu hatası."""
+        kayit = self._son_sunucu_hatasi
+        if kayit and kayit[0] >= self._opened_at - 0.5:
+            return kayit[1]
+        return None
+
+    @staticmethod
+    def _yetki_hatasi_mi(mesaj):
+        kucuk = str(mesaj or "").lower()
+        # 409 (Conflict): bu sağlayıcı bağlantı sınırı doluyken 409 döndürüyor
+        # (günlükte: "HTTP error 409" + hesap 1/1).
+        return any(k in kucuk for k in ("401", "403", "409", "509", "forbidden",
+                                         "conflict", "unauthorized", "too many"))
 
     # ---------------------- KOPMA SONRASI YENİDEN BAĞLANMA ----------------------
     _KOPMA_AZAMI = 8   # internet varken art arda başarısız yeniden bağlanma sınırı
@@ -3656,6 +3928,113 @@ class PlayerWindow:
 
         threading.Thread(target=is_, daemon=True).start()
 
+    def _hesap_sor(self):
+        """Xtream hesap durumunu arka planda sorar (açık bağlantı / limit / süre)."""
+        if self._hesap_soruluyor:
+            return
+        self._hesap_soruluyor = True
+        kaynak = self.source
+
+        def is_():
+            bilgi = None
+            try:
+                yanit = requests.get(
+                    f"{str(kaynak['base']).rstrip('/')}/player_api.php",
+                    params={"username": kaynak["user"], "password": kaynak["pass"]},
+                    headers={"User-Agent": "IPTVPanel/3.0"}, timeout=8)
+                yanit.raise_for_status()
+                bilgi = (yanit.json() or {}).get("user_info") or {}
+            except Exception as e:
+                gunluk(f"hesap sorgusu başarısız: {e}")
+                bilgi = None
+            self._hesap = (time.time(), bilgi)
+            self._hesap_soruluyor = False
+            if bilgi:
+                gunluk(f"hesap: durum={bilgi.get('status')} auth={bilgi.get('auth')} "
+                       f"bağlantı={bilgi.get('active_cons')}/{bilgi.get('max_connections')}")
+
+        threading.Thread(target=is_, daemon=True).start()
+
+    def _hesap_durumu(self):
+        """Sunucu bağlantıyı reddettikten sonra hesabın durumuna bakar.
+
+        Hesap sayacı bizim kendi bağlantımızı da sayar; bu yüzden yalnızca
+        bir deneme REDDEDİLDİKTEN sonra (bağlantımız kapalıyken) sorulur.
+        Dönüş (tür, metin):
+          ("?", "")       sorgu sürüyor, sonraki turda bakılacak
+          ("limit", m)    bağlantı sınırı dolu (çoğunlukla kopan eski bağlantı)
+          ("hesap", m)    hesap kapalı / süresi dolmuş / doğrulanamadı
+          (None, "")      hesapta sorun görünmüyor ya da bilinmiyor
+        """
+        now = time.time()
+        if self._hesap is None or now - self._hesap[0] > 10:
+            self._hesap_sor()
+            return "?", ""
+        bilgi = self._hesap[1]
+        if not bilgi:
+            return None, ""
+        if str(bilgi.get("auth", 1)) == "0":
+            return "hesap", "Hesap doğrulanamadı (kullanıcı adı/parola ya da hesap kapalı)"
+        durum = str(bilgi.get("status") or "").lower()
+        if durum and durum not in ("active", "aktif"):
+            return "hesap", f"Hesap durumu: {bilgi.get('status')}"
+        try:
+            aktif = int(bilgi.get("active_cons") or 0)
+            sinir = int(bilgi.get("max_connections") or 0)
+        except (TypeError, ValueError):
+            return None, ""
+        if sinir > 0 and aktif >= sinir:
+            return "limit", f"{aktif}/{sinir}"
+        return None, ""
+
+    _LIMIT_ARALIK = 20     # sn: bağlantı sınırı doluyken yeniden deneme aralığı
+    # sn: günlükte sunucu kopan bağlantıyı 20 dk'dan uzun süre açık saydı.
+    _LIMIT_AZAMI = 1800
+
+    def _yetki_reddi(self, now):
+        """Son deneme 401/403/509 ile reddedildi. True: durum burada ele alındı."""
+        tur, metin = self._hesap_durumu()
+        if tur == "?":
+            return True
+        if tur == "hesap":
+            gunluk(f"hesap sorunu: {metin}")
+            self._limit_bas_an = 0.0
+            self._denenenler.append(metin)
+            self._kopma_an = 0.0
+            self._yayin_basarisiz()
+            return True
+        if tur != "limit":
+            self._limit_bas_an = 0.0
+            return False
+        if not self._limit_bas_an:
+            self._limit_bas_an = now
+            self._limit_son_deneme = now
+            gunluk(f"bağlantı sınırı dolu ({metin}): bekleniyor")
+        if now - self._limit_bas_an > self._LIMIT_AZAMI:
+            self._limit_bas_an = 0.0
+            self._denenenler.append(f"bağlantı sınırı {self._LIMIT_AZAMI // 60} dk boyunca boşalmadı")
+            self._kopma_an = 0.0
+            self._yayin_basarisiz()
+            return True
+        kalan = int(self._LIMIT_ARALIK - (now - self._limit_son_deneme))
+        if kalan > 0:
+            if now - self._hesap_bekleme_an > 1:
+                self._hesap_bekleme_an = now
+                gecen = int((now - self._limit_bas_an) // 60)
+                self.notice(f"Sağlayıcı bağlantı sınırı dolu ({metin}).\n"
+                            "Kopan önceki bağlantı sağlayıcının sunucusunda hâlâ açık görünüyor;\n"
+                            "bu sunucu tarafında ve sağlayıcı bırakınca kendiliğinden açılır.\n"
+                            f"{kalan} sn sonra tekrar denenecek"
+                            + (f" (bekleniyor: {gecen} dk)" if gecen else "") + ".",
+                            2)
+            return True
+        self._limit_son_deneme = now
+        self._son_deneme_an = now
+        self._son_kopma_deneme = now if self._kopma_an else self._son_kopma_deneme
+        self._hesap = None
+        self.reload(keep_position=not self.is_live, message="Tekrar bağlanılıyor…")
+        return True
+
     def _gercek_son_mu(self, state):
         """VOD gerçekten bittiyse (sona yakın) yeniden bağlanma yapılmaz."""
         if self.is_live or state != "ended":
@@ -3689,9 +4068,19 @@ class PlayerWindow:
             return
         if not sonuc[1]:
             # İnternet yok: deneme hakkı harcamadan bekle, gelir gelmez bağlan.
+            if not getattr(self, "_net_yok_bildirildi", False):
+                gunluk("internet yok: bekleniyor")
+                self._net_yok_bildirildi = True
+                self._cmd("stop")            # asılı kalan eski bağlantıyı bırak
             self._ag_sonuc = None
             self.notice("İnternet bağlantısı yok — bağlantı bekleniyor…", 4)
             return
+        self._net_yok_bildirildi = False
+        if state == "error" and self._yetki_hatasi_mi(self._bu_denemenin_hatasi()):
+            # Yeniden bağlanma reddedildi: sunucu kopan bağlantıyı hâlâ açık
+            # sayıyor olabilir. Deneme hakkı harcamadan aralıklı tekrar dene.
+            if self._yetki_reddi(now):
+                return
         if self._kopma_deneme >= self._KOPMA_AZAMI:
             self._denenenler = [f"{self._kopma_deneme} kez yeniden bağlanma"]
             self._kopma_an = 0.0
@@ -3708,15 +4097,6 @@ class PlayerWindow:
             return max(3, min(60, int(self.settings.get("open_timeout", 10))))
         except (TypeError, ValueError):
             return 10
-
-    def _geri_sayim_goster(self, kalan):
-        """Bekleme sırasında kullanıcıya ne olduğunu göster."""
-        if kalan == getattr(self, "_son_geri_sayim", None):
-            return
-        self._son_geri_sayim = kalan
-        toplam = len(self._stratejiler) or len(self._uzanti_adaylari())
-        self.notice(f"Yayın yanıt vermiyor — {kalan} sn sonra alternatif denenecek"
-                    + (f" ({toplam} seçenek)" if toplam else ""), 3)
 
     def _try_fallback(self, sebep):
         if not self._stratejiler:
@@ -3744,12 +4124,16 @@ class PlayerWindow:
 
     def _yayin_basarisiz(self):
         """Kurtarma listesi tükendi: döngüyü durdur, net bilgi ver."""
+        gunluk(f"BAŞARISIZ: denenenler={self._denenenler} sunucu={self._son_sunucu_hatasi}")
         self._basarisiz = True
         self._opened_at = 0
         self._cmd("stop")
         denenen = ", ".join(self._denenenler) if self._denenenler else "—"
+        sunucu = ""
+        if self._son_sunucu_hatasi and time.time() - self._son_sunucu_hatasi[0] < 120:
+            sunucu = f"Sunucu yanıtı: {self._son_sunucu_hatasi[1][:90]}\n\n"
         metin = ("Yayın açılamadı.\n\n"
-                 f"Denenenler: {denenen}\n\n"
+                 f"Denenenler: {denenen}\n\n" + sunucu +
                  "Bu içerik sağlayıcıda olmayabilir veya bağlantınız\n"
                  "yayını taşıyamıyor olabilir.\n\n"
                  "▶ düğmesine basarak yeniden deneyebilir,\n"
@@ -3772,9 +4156,11 @@ class PlayerWindow:
             if state != self._last_state:
                 previous = self._last_state
                 self._last_state = state
+                gunluk(f"durum: {previous} -> {state}")
                 if state == "playing":
                     self._played_any = True
                     self._acildi = True
+                    self._limit_bas_an = 0.0
                     if self._kopma_an:
                         self._kopma_an = 0.0
                         self._kopma_deneme = 0
@@ -3795,7 +4181,7 @@ class PlayerWindow:
                     if self._acildi or self._kopma_an:
                         self.notice("Bağlantı koptu — yeniden bağlanılıyor…", 5)
                     else:
-                        self.notice("Yayın açılamadı, alternatif deneniyor…", 5)
+                        self.notice("Yayın açılamadı — sebep kontrol ediliyor…", 5)
                 elif state == "ended":
                     self.btn_play.configure(text="▶")
             if time.time() > self._notice_until and state == "playing":
@@ -3808,6 +4194,7 @@ class PlayerWindow:
                 if self._track_tries % aralik == 0:
                     self.refresh_tracks()
             self._watchdog(state)
+            self._izleme_guncelle(state)
             self._update_state_label(state)
             self._stats_skip = (self._stats_skip + 1) % 4
             if self._stats_skip == 0:
@@ -3846,6 +4233,10 @@ class PlayerWindow:
                 gp.kapat()
             except Exception:
                 pass
+        try:
+            self._izleme_kapanista()
+        except Exception as e:
+            print(f"Kaldığı yer kaydedilemedi: {e}")
         player, self.mpv = self.mpv, None
         if player is not None:
             def _shutdown():
