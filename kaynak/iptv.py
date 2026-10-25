@@ -377,6 +377,7 @@ def mpv_hedef_klasor():
 
 # ============================== KİMLİK / SİMGE ==============================
 APP_NAME = "By Krersn Studio"
+APP_VERSION = "1.1.0"   # derle.ps1 kurulum dosyasina bu surumu yazar
 APP_ID = "KrersnStudio.IPTV"
 
 def varlik_yolu(ad):

@@ -19,9 +19,12 @@ Windows için hızlı, sade bir **Xtream Codes** IPTV oynatıcısı. Python + li
 
 ## İndirme
 
-1. [Releases](../../releases/latest) sayfasından `KrersnIPTV-Windows-x64-….zip` dosyasını indirin.
-2. Zip'i bir klasöre çıkarın (klasörün tamamı gerekir, exe tek başına çalışmaz).
-3. `By Krersn Studio.exe` dosyasını açın.
+1. [Releases](../../releases/latest) sayfasından `KrersnIPTV-Setup-v….exe` dosyasını indirin.
+2. Çift tıklayıp kurun. Yönetici izni gerekmez; masaüstüne ve Başlat menüsüne kısayol eklenir.
+3. **Krersn IPTV** kısayolundan açın.
+
+Yeni sürümü aynı şekilde kurmanız yeterli; ayarlar, favoriler ve izleme geçmişi korunur.
+Kaldırmak için: Windows Ayarlar → Uygulamalar → **Krersn IPTV** → Kaldır.
 
 İlk açılışta Windows SmartScreen "tanınmayan uygulama" uyarısı verebilir:
 **Ek bilgi → Yine de çalıştır**. (Uygulama kod imzalı değildir.)
@@ -47,26 +50,28 @@ Gereksinim: Windows 10/11, 64-bit.
 | Esc | Tam ekrandan çık |
 | F1 | Kısayol listesi |
 
-## Kaynaktan çalıştırma / derleme
+## Kaynak kod
+
+Kaynak kod [`kaynak/`](kaynak/) klasöründedir. Sadece kullanmak istiyorsanız buna ihtiyacınız yok; yukarıdaki kurulum dosyası yeterli.
 
 ```powershell
+cd kaynak
 pip install -r requirements.txt pyinstaller
-# libmpv-2.dll dosyasını proje köküne koyun:
+# libmpv-2.dll dosyasını kaynak klasörüne koyun:
 # https://github.com/shinchiro/mpv-winbuild-cmake/releases  (mpv-dev-x86_64-*.7z)
 python iptv.py                                        # kaynaktan çalıştır
-powershell -ExecutionPolicy Bypass -File derle.ps1    # EXE derle -> dist\KrersnStudio\
+powershell -ExecutionPolicy Bypass -File derle.ps1    # EXE + kurulum -> dist\KrersnStudio\, kurulum\
+# Kurulum dosyası için bir kez: winget install JRSoftware.InnoSetup
 ```
 
 Ayarlar ve giriş bilgileri kullanıcının kendi bilgisayarında `%USERPROFILE%\.iptv_panel\` klasöründe tutulur; hiçbir yere gönderilmez.
 
-Yeni sürüm etiketi (`v*`) gönderildiğinde GitHub Actions EXE'yi Windows'ta derleyip Releases'a ekler.
-
 ## Lisans
 
-GPL-3.0 — ayrıntılar için `LICENSE`. Paketlenen EXE, GPL lisanslı [mpv/libmpv](https://mpv.io) içerir.
+GPL-3.0 — ayrıntılar için [`LICENSE`](LICENSE). Kurulum dosyası, GPL lisanslı [mpv/libmpv](https://mpv.io) içerir.
 
 ---
 
-**English:** Lightweight Xtream Codes IPTV player for Windows (Python + libmpv). It ships **no content**; use it with your own legal IPTV subscription. Download the zip from Releases, extract, run `By Krersn Studio.exe`.
+**English:** Lightweight Xtream Codes IPTV player for Windows (Python + libmpv). It ships **no content**; use it with your own legal IPTV subscription. Download `KrersnIPTV-Setup-v….exe` from Releases and install it (no admin rights needed). Source code is in [`kaynak/`](kaynak/).
 
 © Krersn Studio — [krersnstudio.com](https://krersnstudio.com)

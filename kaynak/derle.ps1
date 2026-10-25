@@ -127,6 +127,35 @@ if (Test-Path $exe) {
     Yaz "EXE bulunamadi, derleme ciktisini kontrol edin." "Red"
     exit 1
 }
+Yaz "5) Kurulum dosyasi (Inno Setup)..." "Cyan"
+$surum = "1.0.0"
+$eslesme = Select-String -Path (Join-Path $Proje "iptv.py") -Pattern '^APP_VERSION\s*=\s*"([^"]+)"' | Select-Object -First 1
+if ($eslesme) { $surum = $eslesme.Matches[0].Groups[1].Value }
+$iscc = $null
+$komut = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
+if ($komut) { $iscc = $komut.Source }
+if (-not $iscc) {
+    foreach ($aday in @(
+        (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+        (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"))) {
+        if ($aday -and (Test-Path $aday)) { $iscc = $aday; break }
+    }
+}
+if (-not $iscc) {
+    Yaz "   Inno Setup bulunamadi; kurulum dosyasi atlandi (EXE yine hazir)." "Yellow"
+    Yaz "   Kurmak icin:  winget install JRSoftware.InnoSetup" "Yellow"
+} else {
+    & $iscc "/Qp" "/DAppVersion=$surum" "/DKaynak=$Hedef" (Join-Path $Proje "kurulum.iss")
+    $setup = Join-Path $Proje ("kurulum\KrersnIPTV-Setup-v{0}.exe" -f $surum)
+    if ($LASTEXITCODE -eq 0 -and (Test-Path $setup)) {
+        $mb = [math]::Round((Get-Item $setup).Length / 1MB, 1)
+        Yaz ("Kurulum hazir: {0} ({1} MB)" -f $setup, $mb) "Green"
+    } else {
+        Yaz "   Kurulum dosyasi olusturulamadi (yukaridaki Inno Setup ciktisina bakin)." "Red"
+    }
+}
+
 if (-not $silindi) {
     Write-Host ""
     Yaz "NOT: Eski 'dist' klasoru silinemedi. Bilgisayari yeniden baslattiktan" "Yellow"
